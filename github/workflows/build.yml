@@ -1,0 +1,275 @@
+name: Build LiveContainer Plus
+
+# Fetches LiveContainer's source, applies the LC Plus patches, builds the IPA(s) on a macOS runner
+# and publishes them as a release in this repo. Run it from the Actions tab -> "Build LiveContainer Plus" -> Run workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "LiveContainer version: nightly = newest code on the default branch, stable = latest release"
+        type: choice
+        default: nightly
+        options: [nightly, stable]
+      package:
+        description: "Which IPA to build"
+        type: choice
+        default: both
+        options: [both, LiveContainer, LiveContainer+SideStore]
+      source_repo:
+        description: "Where to fetch LiveContainer's code from"
+        type: choice
+        default: LiveContainer/LiveContainer
+        options: [LiveContainer/LiveContainer, LiveContainerMirror/LiveContainer, custom]
+      custom_repo:
+        description: "owner/name of your own fork (only used when source_repo = custom)"
+        type: string
+        default: ''
+      custom_ref:
+        description: "Optional branch, tag or commit to build (overrides the channel)"
+        type: string
+        default: ''
+      app_name:
+        description: "App name shown on the home screen"
+        type: string
+        default: 'LiveContainer Plus'
+      bundle_id:
+        description: "Bundle ID (extensions follow it). Libraries/extensions follow it. Use com.kdt.livecontainer to update stock LiveContainer in place and keep its data"
+        type: string
+        default: 'com.kdt.livecontainer.plus'
+      f_multi_instance:
+        description: "Feature: several instances of the same app (up to 16)"
+        type: boolean
+        default: true
+      f_snapping:
+        description: "Feature: window snapping, presets, tile all"
+        type: boolean
+        default: true
+      f_scale:
+        description: "Feature: default window scale slider"
+        type: boolean
+        default: true
+      f_dock:
+        description: "Feature: dock controls (bars follow expand/collapse, tile/show/close all)"
+        type: boolean
+        default: true
+      f_appearance:
+        description: "Feature: background image, Liquid Glass banners, grid home screen"
+        type: boolean
+        default: true
+      strict:
+        description: "Fail the build if any selected feature can't be applied to this LiveContainer version"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Only patch the source and upload it (no build) - quick way to check the patches apply"
+        type: boolean
+        default: false
+  push:
+    paths: ['input/source.zip']   # upload your own LiveContainer source here to build it with LC Plus
+
+permissions:
+  contents: write
+
+env:
+  XCODE_VERSION: '26.2'     # LiveContainer needs the iOS 26 SDK; change if the runner image moves on
+  scheme: LiveContainer
+  archive_path: archive
+
+concurrency:
+  group: build-lcplus
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout LC Plus
+        uses: actions/checkout@v4
+
+      - name: Pick Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: ${{ env.XCODE_VERSION }}
+
+      - name: Fetch LiveContainer source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          CHANNEL: ${{ inputs.channel }}
+          SOURCE_REPO: ${{ inputs.source_repo }}
+          CUSTOM_REPO: ${{ inputs.custom_repo }}
+          CUSTOM_REF: ${{ inputs.custom_ref }}
+        run: |
+          set -euo pipefail
+          rm -rf lc
+
+          if [ "$EVENT" = "push" ]; then
+            echo "Building your uploaded source (input/source.zip)"
+            mkdir lc_unzip && unzip -q input/source.zip -d lc_unzip
+            entries=$(ls -A lc_unzip | wc -l | tr -d ' ')
+            if [ "$entries" = "1" ] && [ -d "lc_unzip/$(ls -A lc_unzip)" ]; then
+              mv "lc_unzip/$(ls -A lc_unzip)" lc
+            else
+              mv lc_unzip lc
+            fi
+            echo "SRC_DESC=uploaded source.zip" >> "$GITHUB_ENV"
+            echo "REF_LABEL=custom-source" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          REPO="${SOURCE_REPO:-LiveContainer/LiveContainer}"
+          if [ "$REPO" = "custom" ]; then REPO="$CUSTOM_REPO"; fi
+          if ! echo "$REPO" | grep -Eq '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'; then
+            echo "::error::'$REPO' is not a valid owner/name"; exit 1
+          fi
+
+          default_branch=$(git ls-remote --symref "https://github.com/$REPO" HEAD | awk '/^ref:/ {sub("refs/heads/","",$2); print $2; exit}')
+          if [ -z "$default_branch" ]; then echo "::error::can't reach https://github.com/$REPO"; exit 1; fi
+
+          if [ -n "$CUSTOM_REF" ]; then
+            REF="$CUSTOM_REF"
+          elif [ "${CHANNEL:-nightly}" = "stable" ]; then
+            REF=$(gh api "repos/$REPO/releases/latest" --jq .tag_name 2>/dev/null || true)
+            if [ -z "$REF" ]; then
+              echo "::warning::$REPO has no stable release, using $default_branch instead"
+              REF="$default_branch"
+            fi
+          else
+            REF="$default_branch"
+          fi
+
+          echo "Fetching $REPO @ $REF"
+          git init -q lc
+          git -C lc remote add origin "https://github.com/$REPO"
+          git -C lc fetch -q --depth 1 origin "$REF"
+          git -C lc checkout -q FETCH_HEAD
+          git -C lc submodule update --init --recursive
+          SHA=$(git -C lc rev-parse --short HEAD)
+          echo "SRC_DESC=$REPO @ $REF ($SHA)" >> "$GITHUB_ENV"
+          echo "REF_LABEL=$(echo "$REF" | tr '/' '-')" >> "$GITHUB_ENV"
+
+      - name: Apply LC Plus
+        env:
+          EVENT: ${{ github.event_name }}
+          F_MULTI: ${{ inputs.f_multi_instance }}
+          F_SNAP: ${{ inputs.f_snapping }}
+          F_SCALE: ${{ inputs.f_scale }}
+          F_DOCK: ${{ inputs.f_dock }}
+          F_APPEARANCE: ${{ inputs.f_appearance }}
+          STRICT: ${{ inputs.strict }}
+          APP_NAME: ${{ inputs.app_name }}
+          BUNDLE_ID: ${{ inputs.bundle_id }}
+        run: |
+          set -euo pipefail
+          APP_NAME="${APP_NAME:-LiveContainer Plus}"
+          BUNDLE_ID="${BUNDLE_ID:-com.kdt.livecontainer.plus}"
+          if ! echo "$APP_NAME" | grep -Eq '^[A-Za-z0-9 +._-]{1,30}$'; then echo "::error::app_name: letters, digits, space, + . _ - only (max 30)"; exit 1; fi
+          if ! echo "$BUNDLE_ID" | grep -Eq '^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$'; then echo "::error::bundle_id must look like com.example.name"; exit 1; fi
+          echo "APP_NAME=$APP_NAME" >> "$GITHUB_ENV"
+          echo "APP_SLUG=$(echo "$APP_NAME" | tr -cd 'A-Za-z0-9')" >> "$GITHUB_ENV"
+          echo "BUNDLE_ID=$BUNDLE_ID" >> "$GITHUB_ENV"
+          features=""
+          add() { features="${features:+$features,}$1"; }
+          [ "${F_MULTI:-true}" != "false" ] && add multi_instance
+          [ "${F_SNAP:-true}" != "false" ] && add snapping
+          [ "${F_SCALE:-true}" != "false" ] && add scale
+          [ "${F_DOCK:-true}" != "false" ] && add dock
+          [ "${F_APPEARANCE:-true}" != "false" ] && add appearance
+          echo "features: $features"
+          args=""
+          [ "${STRICT:-false}" = "true" ] && args="--strict"
+          python3 patcher/apply.py --lc lc --features "$features" --app-name "$APP_NAME" --bundle-id "$BUNDLE_ID" --report report.md $args
+          {
+            echo "## $APP_NAME"
+            echo "Source: $SRC_DESC"
+            echo "Bundle ID: $BUNDLE_ID"
+            echo
+            cat report.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload patched source (dry run)
+        if: ${{ inputs.dry_run }}
+        run: |
+          rm -rf lc/.git
+          zip -qr patched-source.zip lc
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.dry_run }}
+        with:
+          name: patched-source
+          path: patched-source.zip
+
+      - name: Build (xcodebuild archive)
+        if: ${{ !inputs.dry_run }}
+        working-directory: lc
+        run: |
+          set -euo pipefail
+          file_to_build=$(ls -A | grep -i '\.xcodeproj$' | head -1)
+          xcodebuild archive -archivePath "$archive_path" -scheme "$scheme" -project "$file_to_build" \
+            -sdk iphoneos -arch arm64 -configuration Release 2>&1 | tee ../build.log | xcpretty
+          test -d "$archive_path.xcarchive"
+
+      - name: Package IPA(s)
+        if: ${{ !inputs.dry_run }}
+        working-directory: lc
+        env:
+          PACKAGE: ${{ inputs.package }}
+        run: |
+          set -euo pipefail
+          PACKAGE="${PACKAGE:-both}"
+          export scheme archive_path
+          if [ "$PACKAGE" = "LiveContainer" ]; then
+            mv "$archive_path.xcarchive/Products/Applications" Payload
+            rm -rf Payload/LiveContainer.app/Frameworks/SideStoreSupport.framework
+            zip -qr "$scheme.ipa" Payload -x "._*" -x ".DS_Store" -x "__MACOSX"
+          else
+            test -f .github/build_github.sh || { echo "::error::this source has no .github/build_github.sh, can't build the SideStore variant"; exit 1; }
+            sh .github/build_github.sh
+          fi
+          mkdir -p ../out
+          if [ "$PACKAGE" != "LiveContainer+SideStore" ]; then
+            cp "$scheme.ipa" "../out/${APP_SLUG}-${REF_LABEL}.ipa"
+          fi
+          if [ "$PACKAGE" != "LiveContainer" ]; then
+            cp "$scheme+SideStore.ipa" "../out/${APP_SLUG}+SideStore-${REF_LABEL}.ipa"
+          fi
+          ls -l ../out
+
+      - name: Upload build log
+        if: ${{ always() && !inputs.dry_run }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+
+      - name: Show compiler errors
+        if: ${{ failure() && !inputs.dry_run }}
+        run: |
+          if [ -f build.log ]; then
+            {
+              echo "## First build errors"
+              echo '```'
+              grep -E "error:" build.log | sort -u | head -40
+              echo '```'
+              echo "A feature that breaks the build can be switched off in the run form (f_* switches). Full log: build-log artifact."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Publish release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          {
+            echo "**$APP_NAME** (\`$BUNDLE_ID\`) built from **$SRC_DESC**."
+            echo
+            cat report.md
+            echo
+            echo "Install with SideStore. Keep app extensions when installing, same as stock LiveContainer."
+          } > release-notes.md
+          gh release create "lcplus-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}" out/*.ipa \
+            --title "${APP_NAME} #${GITHUB_RUN_NUMBER} - ${REF_LABEL}" \
+            --notes-file release-notes.md \
+            --prerelease
