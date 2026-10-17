@@ -10,12 +10,22 @@ the patches, builds the IPA on a free macOS runner and puts it in a release. Whe
 - **Several instances of the same app** (up to 16) in separate windows, all using the same Documents / Library / Caches.
   Tapping Run on an app that is already open starts another window instead of jumping to the old one. No second
   container and no LC2/LC3 copies needed.
-- **Snapping**: windows snap to screen edges, the screen middle and *each other* while you drag or resize.
-  Dropping a window on the left/right screen edge makes it an exact 50/50 half.
+- **Windows don't interrupt each other**: every window is its own process, and iOS normally pauses one app's audio
+  when another starts playing. Windows now ask for "mix with others", so two instances of the same app (or a video in
+  one window and music in another) play at once. Toggle in Settings → Multitask.
+- **Snapping**: windows snap to screen edges, the screen middle and *each other* while you drag or resize (blue guide
+  line + a small haptic tick when a snap engages). Dropping a window on the left/right screen edge makes it an exact
+  50/50 half.
+- **Smart snap** (on by default, no grid setting needed): every halves/thirds/quarters position is a snap target, and when
+  you let go a window that *looks like* a quarter, third or half becomes exactly that, so resizing "just works".
 - **Snap grid** (Settings → Multitask → LC Plus): halves, thirds, fourths, quarters, ninths (3×3), sixteenths (4×4) or
   your own columns × rows. Released windows lock to the grid cells. Dragging stays free-form when the grid is off.
 - **Presets in the window title menu** (tap the app name): full screen, halves, thirds, two-thirds, fourths, quarters,
   ninths, sixteenths, plus a menu for your custom grid.
+- **Whole screen when the dock is collapsed**: expanded, windows stay inside the safe area like stock; collapsed, they
+  use the entire screen (no LiveContainer bezel showing around them). Existing windows stretch with it, snapping and
+  Tile are based on the full screen, and a window that reaches the screen edges gets the real device insets and square
+  corners, so it looks like a fullscreen launch (just without the button). Turn it off in Settings → Multitask.
 - **Dock controls**: the dock's arrow expands/collapses it. Expanded = every window shows its bar; collapsed = bars hide
   so the apps are just apps (drag the thin strip at the top of a window to move it, double-tap it to bring the bars back).
   New dock buttons: **Tile** (auto-arranges all windows: 2 → side by side, 3 → thirds, 4 → 2×2 … up to 16),
@@ -23,7 +33,8 @@ the patches, builds the IPA on a free macOS runner and puts it in a release. Whe
 - **Default window scale** slider in Multitask settings.
 
 **Home screen**
-- **Custom background**: black by default, or any image (Settings → Appearance (LC Plus)).
+- **Custom background**: black by default, or any image (Settings → Appearance (LC Plus)). It shows on the app list,
+  Sources (repos), Tweaks and Settings, plus their sub-pages.
 - **Liquid Glass banners** in the list layout, see-through over the background. On iOS 26 this is the real system glass,
   so it follows your *Clear / Tinted* choice (Settings → Display & Brightness → Liquid Glass). A tint slider adds extra
   colour; 0 = pure system glass. Older iOS gets a blurred material.
@@ -95,6 +106,11 @@ on your machine against whatever is current (needs only git, python3 and the tre
   with the `f_*` switches. Send me the log and I'll fix it.
 - **Same app, same data:** instances share Documents/Library/Caches and preferences. Apps that keep SQLite databases or
   lock files can corrupt each other's data or crash. Use it where that's acceptable (emulators, viewers, tools).
+- Audio events are logged to `Documents/LCPlusAudio.log` inside each app's container (Files app → LiveContainer → the app's
+  data folder). If two windows still pause each other, that log shows which audio category the app asked for and any
+  interruption iOS sent, which is exactly what's needed to fix the next case.
+- Audio mixing covers apps that use AVAudioSession (nearly all of them: YouTube, players, games). An app that picks its own
+  exclusive audio route, or one that detects another running copy of itself, can still misbehave.
 - iOS may kill background processes when memory runs low; sixteen heavy apps won't survive. Light apps will.
 - Multi-instance works in **virtual window mode** (the default on iPhone). Native iPad windows are unchanged.
 - The grid launch uses LiveContainer's normal launch path, so locked apps still ask for authentication.
