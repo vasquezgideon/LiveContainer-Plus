@@ -1,0 +1,304 @@
+name: Build LiveContainer Plus
+
+# Fetches the LiveContainer source, applies the LiveContainer Plus patches, builds the IPA(s) on a macOS runner and
+# publishes them as a release of this repository. Start it from Actions → Build LiveContainer Plus → Run workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Source: official, mirror, fork (fork_repo), uploaded (input/source.zip) or url (source_url)"
+        type: choice
+        default: official
+        options: [official, mirror, fork, uploaded, url]
+      channel:
+        description: "Version for official, mirror and fork sources: nightly = latest commit, stable = latest release"
+        type: choice
+        default: nightly
+        options: [nightly, stable]
+      package:
+        description: "IPA to build"
+        type: choice
+        default: both
+        options: [both, LiveContainer, LiveContainer+SideStore]
+      fork_repo:
+        description: "Fork as owner/name (source = fork)"
+        type: string
+        default: ''
+      source_url:
+        description: "Direct https link to a source .zip (source = url)"
+        type: string
+        default: ''
+      ref:
+        description: "Optional branch, tag or commit; overrides the channel"
+        type: string
+        default: ''
+      app_name:
+        description: "App name"
+        type: string
+        default: 'LiveContainer Plus'
+      bundle_id:
+        description: "Bundle identifier (extensions and libraries follow it); com.kdt.livecontainer updates stock LiveContainer in place"
+        type: string
+        default: 'com.kdt.livecontainer.plus'
+      f_multi_instance:
+        description: "Multiple instances per app"
+        type: boolean
+        default: true
+      f_snapping:
+        description: "Window snapping and layouts"
+        type: boolean
+        default: true
+      f_scale:
+        description: "Default window scale"
+        type: boolean
+        default: true
+      f_dock:
+        description: "Dock controls"
+        type: boolean
+        default: true
+      f_audio:
+        description: "Concurrent audio and video"
+        type: boolean
+        default: true
+      f_appearance:
+        description: "Appearance: background, Liquid Glass, grid layout"
+        type: boolean
+        default: true
+      strict:
+        description: "Fail if a selected feature cannot be applied to this LiveContainer version"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Apply the patches and publish the patched source only (no build)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  XCODE_VERSION: '26.2'
+  scheme: LiveContainer
+  archive_path: archive
+
+concurrency:
+  group: build-livecontainer-plus
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: ${{ env.XCODE_VERSION }}
+
+      - name: Fetch LiveContainer source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE: ${{ inputs.source }}
+          CHANNEL: ${{ inputs.channel }}
+          FORK_REPO: ${{ inputs.fork_repo }}
+          SOURCE_URL: ${{ inputs.source_url }}
+          REF_INPUT: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          rm -rf lc
+
+          # Unpack an archive into ./lc and make sure the submodule folders were included
+          use_archive() {
+            rm -rf lc_unzip && mkdir lc_unzip && unzip -q "$1" -d lc_unzip
+            rm -rf lc_unzip/__MACOSX
+            entries=$(ls -A lc_unzip | wc -l | tr -d ' ')
+            top=$(ls -A lc_unzip | head -1)
+            if [ "$entries" = "1" ] && [ -d "lc_unzip/$top" ]; then mv "lc_unzip/$top" lc; else mv lc_unzip lc; fi
+            if [ -f lc/.gitmodules ]; then
+              for p in $(git config -f lc/.gitmodules --get-regexp '\.path$' | awk '{print $2}'); do
+                if [ -z "$(ls -A "lc/$p" 2>/dev/null)" ]; then
+                  echo "::error::The archive does not contain the '$p' submodule. Archives made with GitHub's 'Download ZIP' leave submodules out; zip a 'git clone --recursive' checkout, or use source = fork."
+                  exit 1
+                fi
+              done
+            fi
+          }
+
+          SOURCE="${SOURCE:-official}"
+          case "$SOURCE" in
+            uploaded)
+              [ -f input/source.zip ] || { echo "::error::input/source.zip was not found in the repository"; exit 1; }
+              use_archive input/source.zip
+              echo "SRC_DESC=uploaded source archive" >> "$GITHUB_ENV"
+              echo "REF_LABEL=uploaded" >> "$GITHUB_ENV"
+              ;;
+            url)
+              case "$SOURCE_URL" in https://*) ;; *) echo "::error::source_url must be an https link"; exit 1 ;; esac
+              curl -fL --retry 3 -o source.zip "$SOURCE_URL"
+              use_archive source.zip
+              echo "SRC_DESC=source archive ($SOURCE_URL)" >> "$GITHUB_ENV"
+              echo "REF_LABEL=archive" >> "$GITHUB_ENV"
+              ;;
+            *)
+              case "$SOURCE" in
+                official) REPO="LiveContainer/LiveContainer" ;;
+                mirror)   REPO="LiveContainerMirror/LiveContainer" ;;
+                fork)     REPO="$FORK_REPO" ;;
+                *) echo "::error::unknown source '$SOURCE'"; exit 1 ;;
+              esac
+              if ! echo "$REPO" | grep -Eq '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'; then
+                echo "::error::'$REPO' is not a valid owner/name"; exit 1
+              fi
+              default_branch=$(git ls-remote --symref "https://github.com/$REPO" HEAD | awk '/^ref:/ {sub("refs/heads/","",$2); print $2; exit}')
+              if [ -z "$default_branch" ]; then echo "::error::cannot reach https://github.com/$REPO"; exit 1; fi
+              if [ -n "$REF_INPUT" ]; then
+                REF="$REF_INPUT"
+              elif [ "${CHANNEL:-nightly}" = "stable" ]; then
+                REF=$(gh api "repos/$REPO/releases/latest" --jq .tag_name 2>/dev/null || true)
+                if [ -z "$REF" ]; then
+                  echo "::warning::$REPO has no stable release; using $default_branch"
+                  REF="$default_branch"
+                fi
+              else
+                REF="$default_branch"
+              fi
+              echo "Fetching $REPO @ $REF"
+              git init -q lc
+              git -C lc remote add origin "https://github.com/$REPO"
+              git -C lc fetch -q --depth 1 origin "$REF"
+              git -C lc checkout -q FETCH_HEAD
+              git -C lc submodule update --init --recursive
+              echo "SRC_DESC=$REPO @ $REF ($(git -C lc rev-parse --short HEAD))" >> "$GITHUB_ENV"
+              echo "REF_LABEL=$(echo "$REF" | tr '/' '-')" >> "$GITHUB_ENV"
+              ;;
+          esac
+
+      - name: Apply LiveContainer Plus
+        env:
+          F_MULTI: ${{ inputs.f_multi_instance }}
+          F_SNAP: ${{ inputs.f_snapping }}
+          F_SCALE: ${{ inputs.f_scale }}
+          F_DOCK: ${{ inputs.f_dock }}
+          F_AUDIO: ${{ inputs.f_audio }}
+          F_APPEARANCE: ${{ inputs.f_appearance }}
+          STRICT: ${{ inputs.strict }}
+          APP_NAME: ${{ inputs.app_name }}
+          BUNDLE_ID: ${{ inputs.bundle_id }}
+        run: |
+          set -euo pipefail
+          APP_NAME="${APP_NAME:-LiveContainer Plus}"
+          BUNDLE_ID="${BUNDLE_ID:-com.kdt.livecontainer.plus}"
+          echo "$APP_NAME" | grep -Eq '^[A-Za-z0-9 +._-]{1,30}$' || { echo "::error::app_name may contain letters, digits, spaces and + . _ - (max 30)"; exit 1; }
+          echo "$BUNDLE_ID" | grep -Eq '^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$' || { echo "::error::bundle_id must look like com.example.name"; exit 1; }
+          {
+            echo "APP_NAME=$APP_NAME"
+            echo "APP_SLUG=$(echo "$APP_NAME" | tr -cd 'A-Za-z0-9')"
+            echo "BUNDLE_ID=$BUNDLE_ID"
+          } >> "$GITHUB_ENV"
+
+          features=""
+          add() { features="${features:+$features,}$1"; }
+          [ "${F_MULTI:-true}" != "false" ] && add multi_instance
+          [ "${F_SNAP:-true}" != "false" ] && add snapping
+          [ "${F_SCALE:-true}" != "false" ] && add scale
+          [ "${F_DOCK:-true}" != "false" ] && add dock
+          [ "${F_AUDIO:-true}" != "false" ] && add audio
+          [ "${F_APPEARANCE:-true}" != "false" ] && add appearance
+          args=""
+          [ "${STRICT:-false}" = "true" ] && args="--strict"
+          python3 patcher/apply.py --lc lc --features "$features" --app-name "$APP_NAME" --bundle-id "$BUNDLE_ID" --report report.md $args
+          {
+            echo "## $APP_NAME"
+            echo "Source: $SRC_DESC"
+            echo "Bundle identifier: \`$BUNDLE_ID\`"
+            echo
+            cat report.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Package patched source (dry run)
+        if: ${{ inputs.dry_run }}
+        run: |
+          rm -rf lc/.git
+          zip -qr patched-source.zip lc
+      - name: Upload patched source (dry run)
+        if: ${{ inputs.dry_run }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched-source
+          path: patched-source.zip
+
+      - name: Build
+        if: ${{ !inputs.dry_run }}
+        working-directory: lc
+        run: |
+          set -euo pipefail
+          project=$(ls -A | grep -i '\.xcodeproj$' | head -1)
+          xcodebuild archive -archivePath "$archive_path" -scheme "$scheme" -project "$project" \
+            -sdk iphoneos -arch arm64 -configuration Release 2>&1 | tee ../build.log | xcpretty
+          test -d "$archive_path.xcarchive"
+
+      - name: Package IPA
+        if: ${{ !inputs.dry_run }}
+        working-directory: lc
+        env:
+          PACKAGE: ${{ inputs.package }}
+        run: |
+          set -euo pipefail
+          PACKAGE="${PACKAGE:-both}"
+          export scheme archive_path
+          if [ "$PACKAGE" = "LiveContainer" ]; then
+            mv "$archive_path.xcarchive/Products/Applications" Payload
+            rm -rf Payload/LiveContainer.app/Frameworks/SideStoreSupport.framework
+            zip -qr "$scheme.ipa" Payload -x "._*" -x ".DS_Store" -x "__MACOSX"
+          else
+            test -f .github/build_github.sh || { echo "::error::this source has no .github/build_github.sh, which is required for the SideStore variant"; exit 1; }
+            sh .github/build_github.sh
+          fi
+          mkdir -p ../out
+          if [ "$PACKAGE" != "LiveContainer+SideStore" ]; then
+            cp "$scheme.ipa" "../out/${APP_SLUG}-${REF_LABEL}.ipa"
+          fi
+          if [ "$PACKAGE" != "LiveContainer" ]; then
+            cp "$scheme+SideStore.ipa" "../out/${APP_SLUG}+SideStore-${REF_LABEL}.ipa"
+          fi
+          ls -l ../out
+
+      - name: Upload build log
+        if: ${{ always() && !inputs.dry_run }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+
+      - name: Summarize build errors
+        if: ${{ failure() && !inputs.dry_run }}
+        run: |
+          if [ -f build.log ]; then
+            {
+              echo "## Build errors"
+              echo '```'
+              grep -E "error:" build.log | sort -u | head -40
+              echo '```'
+              echo "A feature that fails to compile can be switched off with its f_* option. The full log is attached as the build-log artifact."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Publish release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          {
+            echo "**$APP_NAME** (\`$BUNDLE_ID\`), built from $SRC_DESC."
+            echo
+            cat report.md
+          } > release-notes.md
+          gh release create "build-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}" out/*.ipa \
+            --title "${APP_NAME} build ${GITHUB_RUN_NUMBER} (${REF_LABEL})" \
+            --notes-file release-notes.md \
+            --prerelease
