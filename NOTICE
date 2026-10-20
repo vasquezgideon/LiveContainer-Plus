@@ -1,0 +1,8 @@
+LiveContainer Plus
+
+This repository contains patches and additional source files that are applied to LiveContainer
+(https://github.com/LiveContainer/LiveContainer, GNU AGPL v3). Binaries built with these patches are derivative works of
+LiveContainer and are distributed under the GNU Affero General Public License v3.0. Keep the corresponding source of
+any distributed build, including this repository, available to its recipients.
+
+LiveContainer is the work of its respective authors. LiveContainer Plus is not affiliated with or endorsed by them.
